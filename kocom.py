@@ -178,7 +178,7 @@ class RS485Wrapper:
         if self.last_read_time == 0:
             time.sleep(1)
         while time.time() - self.last_read_time < read_write_gap:
-            logging.debug('[**test4**]pending write : time too short after last read')
+            #logging.debug('[**test4**]pending write : time too short after last read')
             time.sleep(max([0, read_write_gap - time.time() + self.last_read_time]))
         if self.type == 'serial':
             return self.conn.write(data)
@@ -347,9 +347,9 @@ def query(device_h, publish=False, enforce=False):
 
 
 def send_wait_response(dest, src=device_h_dic['wallpad']+'00', cmd=cmd_h_dic['state'], value='0'*16, log=None, check_ack=True, publish=True):
-    logging.debug('[**test1**]waiting for send_wait_response :'+dest)
+    #logging.debug('[**test1**]waiting for send_wait_response :'+dest)
     wait_target.put(dest)
-    logging.debug('[**test2**]entered send_wait_response :'+dest)
+    #logging.debug('[**test2**]entered send_wait_response :'+dest)
     ret = { 'value':'0'*16, 'flag':False }
 
     if send(dest, src, cmd, value, log, check_ack) != False:
@@ -360,7 +360,7 @@ def send_wait_response(dest, src=device_h_dic['wallpad']+'00', cmd=cmd_h_dic['st
         except queue.Empty:
             pass
     wait_target.get()
-    logging.debug('[**test3**]exiting send_wait_response :'+dest)
+    #logging.debug('[**test3**]exiting send_wait_response :'+dest)
     return ret
 
 
