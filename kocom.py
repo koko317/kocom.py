@@ -27,7 +27,7 @@ import configparser
 # ═══════════════════════════════════════════════════════════════════
 #  기본 상수
 # ═══════════════════════════════════════════════════════════════════
-SW_VERSION = '2026.05.18'
+SW_VERSION = '2026.05.19'
 CONFIG_FILE = 'kocom.conf'
 BUF_SIZE = 100
 
@@ -480,8 +480,19 @@ def ac_parse(value):
     curtemp_byte = raw[AC_BYTE_CURTEMP] if AC_BYTE_CURTEMP < len(raw) else AC_TEMP_INVALID
     settemp_byte = raw[AC_BYTE_SETTEMP] if AC_BYTE_SETTEMP < len(raw) else AC_TEMP_INVALID
 
-    state = mode_dic.get(mode_byte) if power_byte == 0x10 else 'off'
-    fan   = spd_dic.get(fan_byte)
+    # ── 전원 바이트 해석 ──────────────────────────────────────────────
+    #  0xFF = 삼성 AC 온도 전용 패킷 마커 (전원 상태 미포함)
+    #  0x10 = 전원 켜짐
+    #  0x00 = 전원 꺼짐
+    if power_byte == 0xFF:
+        state = None   # 이 패킷은 전원 상태를 알 수 없음 → merge에서 처리
+        fan   = None
+    elif power_byte == 0x10:
+        state = mode_dic.get(mode_byte, 'cool')
+        fan   = spd_dic.get(fan_byte)
+    else:              # 0x00 또는 기타 → 꺼짐
+        state = 'off'
+        fan   = None
 
     # 0xFF(255) 또는 범위 초과는 None으로 처리
     temperature = curtemp_byte if is_valid_ac_temp(curtemp_byte) else None
@@ -536,16 +547,38 @@ def merge_ac_state(state1, state2):
                 logging.info('[AC MERGE] {}: 양쪽 모두 무효(state1={}, state2={}) '
                              '→ last_good 사용 예정'.format(key, v1, v2))
 
-    # 운전 상태·팬: 비유효값 우선순위
-    for key in ('state', 'fan'):
-        v2 = state2.get(key) if state2 else None
-        v1 = state1.get(key) if state1 else None
-        if v2 is not None and v2 != 'off':
-            merged[key] = v2
-        elif v1 is not None and v1 != 'off':
-            merged[key] = v1
-        else:
-            merged[key] = v2  # 둘 다 off/None이면 state2 유지
+    # ── 운전 상태 (state) ─────────────────────────────────────────────
+    #  None  = 알 수 없음 (0xFF 온도 패킷 — 전원 정보 없음)
+    #  'off' = 확실히 꺼짐 (0x00 상태 패킷)
+    #  mode  = 확실히 켜짐 ('cool'/'heat'/...)
+    #
+    #  우선순위: 켜짐 > 꺼짐 > 알 수 없음(→ 꺼짐으로 처리)
+    v1 = state1.get('state') if state1 else None
+    v2 = state2.get('state') if state2 else None
+    if v1 not in (None, 'off'):        # pkt1 확실히 켜짐
+        merged['state'] = v1
+    elif v2 not in (None, 'off'):      # pkt2 확실히 켜짐
+        merged['state'] = v2
+    elif v1 == 'off' or v2 == 'off':   # 어느 한쪽이 확실히 꺼짐
+        merged['state'] = 'off'
+    else:                               # 양쪽 모두 None (알 수 없음)
+        merged['state'] = 'off'
+        if AC_DEBUG_MODE:
+            logging.info('[AC MERGE] state: 양쪽 모두 None → off로 처리')
+
+    # ── 팬 속도 (fan) ────────────────────────────────────────────────
+    #  None  = 알 수 없음 (0xFF 패킷 또는 꺼짐 패킷)
+    #  mode  = 유효한 팬 속도 ('LOW'/'MEDIUM'/'HIGH')
+    #
+    #  우선순위: 유효값(pkt1) > 유효값(pkt2) > None
+    v1 = state1.get('fan') if state1 else None
+    v2 = state2.get('fan') if state2 else None
+    if v1 is not None:
+        merged['fan'] = v1
+    elif v2 is not None:
+        merged['fan'] = v2
+    else:
+        merged['fan'] = None  # 알 수 없음 → publish_ac_state에서 필터링됨
 
     return merged
 
