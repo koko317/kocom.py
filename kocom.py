@@ -10,10 +10,11 @@ import paho.mqtt.client as mqtt
 import logging
 import configparser
 
+
 # ═══════════════════════════════════════════════════════════════════
 #  기본 상수
 # ═══════════════════════════════════════════════════════════════════
-SW_VERSION = '2026.05.19'
+SW_VERSION = '2026.05.18'
 CONFIG_FILE = 'kocom.conf'
 BUF_SIZE = 100
 
@@ -431,11 +432,27 @@ def ac_parse(value):
     ※ temperature/target 가 None 이면 해당 패킷에서 온도를 읽지 못한 것입니다.
        ac_packet_handler가 두 패킷을 합산하거나 last_good_state로 보완합니다.
     """
+    # ────────────────────────────────────────────────────────────────
+    #  이 삼성 AC는 냉방(cool) 전용입니다.
+    #  'heat'는 보일러(thermo)의 용어이며 AC 패킷에는 존재하지 않습니다.
+    #
+    #  실측 패킷 기준 B1 모드 코드:
+    #    0x00 = cool   (냉방) — B0=0x10일 때
+    #    0x01 = fan_only (송풍) — 추정값, 온도 패킷 도착 후 확정
+    #    0x02 = dry    (제습)   — 추정값
+    #    0xFF = 꺼짐 상태에서 마지막 모드 보존값 (방1 꺼짐 패킷에서 확인)
+    #           → power_byte=0x00 이면 아래 로직에서 'off'로 처리됨
+    # ────────────────────────────────────────────────────────────────
     mode_dic = {
-        0x00: 'cool', 0x01: 'fan_only', 0x02: 'dry',
-        0x03: 'auto', 0x04: 'heat'
+        0x00: 'cool',      # 냉방 (실측 확인)
+        0x01: 'fan_only',  # 송풍 (추정)
+        0x02: 'dry',       # 제습 (추정)
+        # 0x03: 'auto'  — 이 AC 미지원 (패킷 미관측)
+        # 0x04: 'heat'  — AC에 없음! heat는 보일러(thermo) 전용
     }
+    # B2 팬속도: 0x00은 실측 패킷에서 확인됨(auto/내장속도) → None 반환
     spd_dic = {0x01: 'LOW', 0x02: 'MEDIUM', 0x03: 'HIGH'}
+    # 0x00 → dict.get() returns None → HA에 팬속도 없이 발행 (정상)
 
     try:
         raw = bytes.fromhex(value)
@@ -467,16 +484,26 @@ def ac_parse(value):
     settemp_byte = raw[AC_BYTE_SETTEMP] if AC_BYTE_SETTEMP < len(raw) else AC_TEMP_INVALID
 
     # ── 전원 바이트 해석 ──────────────────────────────────────────────
-    #  0xFF = 삼성 AC 온도 전용 패킷 마커 (전원 상태 미포함)
-    #  0x10 = 전원 켜짐
-    #  0x00 = 전원 꺼짐
+    #  실측 패킷에서 확인된 패턴:
+    #
+    #  B0=0xFF  → 온도 전용 패킷 마커 (전원 상태 미포함)
+    #             이전 세션 로그에서 확인: value[ff00000019180000]
+    #
+    #  B0=0x10  → 전원 켜짐
+    #             거실AC ON: value[10000000ffff0000]
+    #
+    #  B0=0x00  → 전원 꺼짐
+    #             거실AC OFF: value[00000000ffff0000]  B4=B5=0xFF (온도 없음)
+    #             방1AC  OFF: value[00ff00000019ff00]  B1=0xFF, B5=마지막설정온도
+    #             → B0=0x00은 꺼짐이 확실. B1=0xFF는 "안정상태" 플래그로 추정
+    #             → 꺼짐 상태에서도 B5에 마지막 설정온도가 남아 있을 수 있음
     if power_byte == 0xFF:
-        state = None   # 이 패킷은 전원 상태를 알 수 없음 → merge에서 처리
+        state = None   # 온도 전용 패킷 → 전원 상태 알 수 없음, merge에서 처리
         fan   = None
     elif power_byte == 0x10:
         state = mode_dic.get(mode_byte, 'cool')
         fan   = spd_dic.get(fan_byte)
-    else:              # 0x00 또는 기타 → 꺼짐
+    else:              # 0x00 → 꺼짐 (B1=0xFF 안정상태 플래그 여부와 무관)
         state = 'off'
         fan   = None
 
@@ -800,8 +827,14 @@ def mqtt_on_message(mqttc, obj, msg):
     # topic: kocom/room/ac/{num}/ac_mode/command
     # command: off | cool | fan_only | dry | auto | heat
     elif 'ac' in topic_d and 'ac_mode' in topic_d:
-        acmode_dic = {'off': 0x00, 'cool': 0x00, 'fan_only': 0x01,
-                      'dry': 0x02, 'auto': 0x03, 'heat': 0x04}
+        # 실측 패킷 기준 모드 코드 (heat=보일러 전용, auto=미지원)
+        acmode_dic = {
+            'cool':     0x00,  # 냉방 (실측 확인)
+            'fan_only': 0x01,  # 송풍 (추정)
+            'dry':      0x02,  # 제습 (추정)
+            # 'auto': 0x03  — 패킷 미관측, 미지원
+            # 'heat': 0x04  — 이 AC 없음. heat는 thermo(보일러) 전용
+        }
         dev_id = device_h_dic['ac'] + '{:02x}'.format(int(topic_d[3]))
 
         if command == 'off':
@@ -1160,7 +1193,9 @@ def publish_discovery(dev, sub=''):
             'temp_stat_tpl': '{{ value_json.target }}',
             'curr_temp_t': 'kocom/room/ac/{}/state'.format(num),
             'curr_temp_tpl': '{{ value_json.temperature }}',
-            'modes': ['off', 'cool', 'fan_only', 'dry', 'auto', 'heat'],
+            # 이 삼성 AC 지원 모드 (실측 패킷 기준)
+            # heat는 보일러(thermo) 전용 — AC discovery에서 제거
+            'modes': ['off', 'cool', 'fan_only', 'dry'],
             'fan_modes': ['LOW', 'MEDIUM', 'HIGH'],
             'min_temp': 18, 'max_temp': 30,
             'uniq_id': 'kocom_ac_{}'.format(num),
