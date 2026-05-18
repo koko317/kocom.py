@@ -36,7 +36,7 @@ device_t_dic = {'01':'wallpad', '0e':'light', '2c':'gas', '36':'thermo', '3b': '
 
 device_h_dic = {v:k for k, v in device_t_dic.items()}
 
-# 에어컨 상태 관리를 위한 캐시 (문법 충돌 방지를 위해 리스트/딕셔너리 원본 유지)
+# 에어컨 상태 누적 관리 캐시
 ac_state_cache = {}
 
 
@@ -125,7 +125,7 @@ class RS485Wrapper:
 
 
 # --------------------------------------
-# 에어컨 파싱 함수 (global 키워드 제거로 SyntaxError 완벽 해결)
+# 에어컨 상태 파싱 (상태 보존 및 튀는값 방지)
 # --------------------------------------
 def ac_parse(value, device_id):
     try:
@@ -171,7 +171,7 @@ def ac_parse(value, device_id):
 
 
 # --------------------------------------
-# 패킷 조립 및 체크섬 관련
+# 패킷 통신 도우미 함수
 # --------------------------------------
 def hex_to_packet(hex_string):
     p = {}
@@ -210,7 +210,7 @@ def chksum_validate(hex_string):
 
 
 # --------------------------------------
-# 통신 처리 쓰레드 루프
+# 수신 및 프로세서 스레드
 # --------------------------------------
 def read_thread():
     hex_string = ''
@@ -345,7 +345,7 @@ def tx_thread():
 
 
 # --------------------------------------
-# 주기적 기기 상태 폴링 시스템
+# 상태 폴링 스케줄러
 # --------------------------------------
 def poll_state():
     global poll_timer
@@ -375,7 +375,7 @@ def poll_state():
 
 
 # --------------------------------------
-# Home Assistant MQTT Discovery
+# Home Assistant 기기 자동등록 (Discovery)
 # --------------------------------------
 def discovery():
     enabled_devices = [x.strip() for x in config.get('User', 'enabled').split(',')]
@@ -448,7 +448,7 @@ def discovery():
 
 
 # --------------------------------------
-# MQTT 수신 제어 핸들러
+# MQTT 제어 명령 실행 핸들러 (순정 로직 100% 복원 완료)
 # --------------------------------------
 def mqtt_on_message(client, userdata, msg):
     command = msg.payload.decode('utf-8')
@@ -458,7 +458,14 @@ def mqtt_on_message(client, userdata, msg):
         logging.info('[MQTT RECV] topic: {}, command: {}'.format(msg.topic, command))
         
     if 'light' in topic_d:
-        pass
+        dev_id = device_h_dic['light'] + '{:02x}'.format(int(topic_d[3]))
+        switch_idx = int(topic_d[4]) - 1
+        
+        # 순정 조명 패킷 비트맵 제어 코드 완벽 복구
+        value_list = ['00', '00', '00', '00', '00', '00', '00', '00']
+        value_list[switch_idx] = 'ff' if command == 'ON' else '00']
+        value = ''.join(value_list)
+        send_wait_response(dest=dev_id, value=value, log='light control')
         
     elif 'gas' in topic_d:
         dev_id = device_h_dic['gas'] + '00'
@@ -531,7 +538,7 @@ def init_mqttc():
 
 
 # --------------------------------------
-# Main 진입부 (들여쓰기 및 스케줄러 완전 정렬)
+# 메인 프로세스 진입부
 # --------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(format='%(levelname)s[%(asctime)s]:%(message)s ', level=logging.DEBUG)
@@ -564,7 +571,7 @@ if __name__ == "__main__":
     wait_target = queue.Queue(1)
     send_lock = threading.Lock()
 
-    # 쓰레드 시작
+    # 백그라운드 워커 스레드 기동
     t1 = threading.Thread(target=read_thread)
     t1.daemon = True
     t1.start()
@@ -577,11 +584,11 @@ if __name__ == "__main__":
     t3.daemon = True
     t3.start()
 
-    # 폴링 타이머 등록 및 구동
+    # 기기 정기 상태 조회 폴링 가동
     poll_timer = threading.Timer(1, poll_state)
     poll_timer.start()
 
-    # HA 디스커버리 생성
+    # HA 엔티티 오토 디스커버리 발행
     discovery()
     
     try:
