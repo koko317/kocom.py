@@ -1,17 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-'''
- python kocom script
-
- : forked from script written by vifrost, kyet, 룰루해피, 따분, Susu Daddy, harwin1
- : Samsung AC RS485 dual-packet support added
-
- apt-get install mosquitto
- python3 -m pip install pyserial
- python3 -m pip install paho-mqtt
- python3 -m pip install typing_extensions
-'''
 import os
 import time
 import platform
@@ -22,7 +9,6 @@ import json
 import paho.mqtt.client as mqtt
 import logging
 import configparser
-
 
 # ═══════════════════════════════════════════════════════════════════
 #  기본 상수
