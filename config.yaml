@@ -1,6 +1,6 @@
 ---
 name: Kocom Wallpad with RS485 for 한국아델리움
-version: 2024.08.06
+version: 2026.05.18
 slug: kocom_py
 description: Kocom Wallpad for Home Assistant
 arch:
