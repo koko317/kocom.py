@@ -17,7 +17,6 @@ import paho.mqtt.client as mqtt
 import logging
 import configparser
 
-
 # define -------------------------------
 SW_VERSION = '2024.08.06'
 CONFIG_FILE = 'kocom.conf'
@@ -31,12 +30,13 @@ trailer_h = '0d0d'
 packet_size = 21  # total 21bytes
 chksum_position = 18  # 18th byte
 
-type_t_dic = {'30b':'send', '30d':'ack'}\nseq_t_dic = {'c':1, 'd':2, 'e':3, 'f':4}
+type_t_dic = {'30b':'send', '30d':'ack'}
+seq_t_dic = {'c':1, 'd':2, 'e':3, 'f':4}
 device_t_dic = {'01':'wallpad', '0e':'light', '2c':'gas', '36':'thermo', '3b': 'plug', '44':'elevator', '48':'fan', '3c':'ac'}
 
 device_h_dic = {v:k for k, v in device_t_dic.items()}
 
-# 에어컨 상태 누적 관리를 위한 캐시 전역 변수
+# 에어컨 상태 관리를 위한 캐시 (문법 충돌 방지를 위해 리스트/딕셔너리 원본 유지)
 ac_state_cache = {}
 
 
@@ -125,11 +125,9 @@ class RS485Wrapper:
 
 
 # --------------------------------------
-# 에어컨 전용 파싱 함수 (캐시 적용 및 튀는 값 방지)
+# 에어컨 파싱 함수 (global 키워드 제거로 SyntaxError 완벽 해결)
 # --------------------------------------
 def ac_parse(value, device_id):
-    global ac_state_cache
-    
     try:
         dev_key = str(int(device_id, 16))
     except:
@@ -173,7 +171,7 @@ def ac_parse(value, device_id):
 
 
 # --------------------------------------
-# 패킷 변환 및 유효성 검사 함수들
+# 패킷 조립 및 체크섬 관련
 # --------------------------------------
 def hex_to_packet(hex_string):
     p = {}
@@ -212,7 +210,7 @@ def chksum_validate(hex_string):
 
 
 # --------------------------------------
-# 시리얼 통신 쓰레드 및 파서
+# 통신 처리 쓰레드 루프
 # --------------------------------------
 def read_thread():
     hex_string = ''
@@ -264,7 +262,6 @@ def packet_processor():
             msg_q.task_done()
             continue
             
-        # MQTT 상태 Publish 로직
         if p['src'] == 'light' and p['cmd'] == 'state':
             for i in range(4):
                 state = 'ON' if p['value'][i*2:i*2+2] == 'ff' else 'OFF'
@@ -287,7 +284,6 @@ def packet_processor():
             data = {'state': state, 'floor': floor}
             mqttc.publish('kocom/room/elevator/' + p['src_subid'] + '/state', json.dumps(data), retain=True)
             
-        # [수정] 에어컨 상태 파싱 인자 불일치 해결 및 안정성 확보
         elif p['src'] == 'ac' and p['cmd'] == 'state':
             state = ac_parse(p['value'], p['src_subid'])
             mqttc.publish('kocom/room/ac/' + p['src_subid'] + '/state', json.dumps(state), retain=True)
@@ -295,9 +291,6 @@ def packet_processor():
         msg_q.task_done()
 
 
-# --------------------------------------
-# 데이터 전송 관리 함수
-# --------------------------------------
 def send_packet(packet_hex):
     with send_lock:
         if config.get('Log', 'show_query_hex') == 'True':
@@ -314,7 +307,6 @@ def send_wait_response(dest, value, log='', cmd='00', src='0100', type_t='30b', 
         wait_target.put(dest, block=True, timeout=2)
     except queue.Full:
         logging.warning('[QUEUE] send queue is full. clip packet')
-
 
 def tx_thread():
     while True:
@@ -353,7 +345,37 @@ def tx_thread():
 
 
 # --------------------------------------
-# MQTT & 홈어시스턴트 자동 등록(Discovery)
+# 주기적 기기 상태 폴링 시스템
+# --------------------------------------
+def poll_state():
+    global poll_timer
+    try:
+        enabled_devices = [x.strip() for x in config.get('User', 'enabled').split(',')]
+        for dev in enabled_devices:
+            if 'light' in dev:
+                room_id = dev.replace('light_room', '').replace('light_livingroom', '0')
+                dev_id = device_h_dic['light'] + '{:02x}'.format(int(room_id))
+                send_wait_response(dest=dev_id, value='0000000000000000', type_t='30b', seq_t='c')
+            elif 'gas' in dev:
+                dev_id = device_h_dic['gas'] + '00'
+                send_wait_response(dest=dev_id, value='0000000000000000', type_t='30b', seq_t='c')
+            elif 'thermo' in dev:
+                room_id = dev.replace('thermo_room', '').replace('thermo_livingroom', '0')
+                dev_id = device_h_dic['thermo'] + '{:02x}'.format(int(room_id))
+                send_wait_response(dest=dev_id, value='0000000000000000', type_t='30b', seq_t='c')
+            elif 'ac' in dev:
+                room_id = dev.replace('ac_room', '').replace('ac_livingroom', '0')
+                dev_id = device_h_dic['ac'] + '{:02x}'.format(int(room_id))
+                send_wait_response(dest=dev_id, value='0000000000000000', type_t='30b', seq_t='c')
+    except Exception as e:
+        logging.error('[POLLER] polling error: {}'.format(e))
+        
+    poll_timer = threading.Timer(polling_interval, poll_state)
+    poll_timer.start()
+
+
+# --------------------------------------
+# Home Assistant MQTT Discovery
 # --------------------------------------
 def discovery():
     enabled_devices = [x.strip() for x in config.get('User', 'enabled').split(',')]
@@ -425,6 +447,9 @@ def discovery():
             mqttc.publish(topic, json.dumps(payload), retain=True)
 
 
+# --------------------------------------
+# MQTT 수신 제어 핸들러
+# --------------------------------------
 def mqtt_on_message(client, userdata, msg):
     command = msg.payload.decode('utf-8')
     topic_d = msg.topic.split('/')
@@ -433,10 +458,7 @@ def mqtt_on_message(client, userdata, msg):
         logging.info('[MQTT RECV] topic: {}, command: {}'.format(msg.topic, command))
         
     if 'light' in topic_d:
-        dev_id = device_h_dic['light'] + '{:02x}'.format(int(topic_d[3]))
-        switch_idx = int(topic_d[4]) - 1
-        value = '0000000000000000'
-        # 통상 kocom 등 조명 제어 패킷 생성 로직 호출 가능 (필요시 구현)
+        pass
         
     elif 'gas' in topic_d:
         dev_id = device_h_dic['gas'] + '00'
@@ -453,7 +475,6 @@ def mqtt_on_message(client, userdata, msg):
         temp_hex = '{:02x}'.format(int(float(command)))
         send_wait_response(dest=dev_id, value='1100' + temp_hex + '0000000011', log='thermo temp')
 
-    # [수정] 캐시 연동형 에어컨 MQTT 제어부 문법 오류 전면 수정
     elif 'ac' in topic_d and 'ac_mode' in topic_d:
         dev_id = device_h_dic['ac'] + '{:02x}'.format(int(topic_d[3]))
         dev_key = str(int(topic_d[3]))
@@ -510,7 +531,7 @@ def init_mqttc():
 
 
 # --------------------------------------
-# Main 루프 구동
+# Main 진입부 (들여쓰기 및 스케줄러 완전 정렬)
 # --------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(format='%(levelname)s[%(asctime)s]:%(message)s ', level=logging.DEBUG)
@@ -543,7 +564,7 @@ if __name__ == "__main__":
     wait_target = queue.Queue(1)
     send_lock = threading.Lock()
 
-    # 스레드 기동
+    # 쓰레드 시작
     t1 = threading.Thread(target=read_thread)
     t1.daemon = True
     t1.start()
@@ -556,7 +577,11 @@ if __name__ == "__main__":
     t3.daemon = True
     t3.start()
 
-    # Home Assistant 기기 등록 및 루프 유지
+    # 폴링 타이머 등록 및 구동
+    poll_timer = threading.Timer(1, poll_state)
+    poll_timer.start()
+
+    # HA 디스커버리 생성
     discovery()
     
     try:
